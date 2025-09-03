@@ -1580,49 +1580,51 @@ Automatically apply specific query patterns when user asks:
             return [], [str(e)]
 
     def generate_final_answer(self, user_question: str, query: str, query_results: List[Dict], column_names: List[str]) -> str:
-        """Generate a professional answer based on the query results with proper formatting for the frontend."""
+        """Generate a professional answer based on the query results with chunking for large datasets."""
         if not query_results:
             return "No results found for your query."
-            
+        
         try:
-            # Use custom JSON encoder to handle datetime objects
-            results_str = json.dumps({
+            # Estimate token count (approximate: 1 token ≈ 4 characters)
+            results_json = json.dumps({
                 "query_results": query_results,
                 "column_names": column_names
-            }, indent=2, cls=CustomJSONEncoder)
+            }, cls=CustomJSONEncoder)
             
-            prompt = f"""
+            estimated_tokens = len(results_json) // 4
+            
+            # If results are too large, use chunking and summarization
+            if estimated_tokens > 20000:  # Conservative threshold to avoid rate limits
+                logger.info(f"Large dataset detected ({estimated_tokens} estimated tokens), using chunked summarization")
+                return self._generate_chunked_answer(user_question, query, query_results, column_names)
+            
+            # For smaller datasets, use the original approach
+            return self._generate_direct_answer(user_question, query, query_results, column_names)
+            
+        except Exception as e:
+            logger.error(f"Error in generate_final_answer: {e}")
+            return f"An error occurred while generating the answer: {str(e)}"
+
+    def _generate_direct_answer(self, user_question: str, query: str, query_results: List[Dict], column_names: List[str]) -> str:
+        """Original implementation for smaller datasets."""
+        results_str = json.dumps({
+            "query_results": query_results,
+            "column_names": column_names
+        }, indent=2, cls=CustomJSONEncoder)
+        
+        prompt = f"""
     You are a professional Chartered Accountant and financial analyst for PowerParts Private Ltd.
-Based on the following user question, SQL query, and query results, generate a concise professional summary that will be perfectly formatted for the frontend UI.
-CRITICAL FORMATTING RULES:
+    Based on the following user question, SQL query, and query results, generate a concise professional summary that will be perfectly formatted for the frontend UI.
 
-Always use this exact bullet point format: "▸ " followed by a space (e.g., ▸ Total Active Customers: 397)
-Do not use markdown symbols like *, **, -, or #
-Format all numbers with commas (e.g., 1,000 not 1000)
-Use clear section headings that are relevant to the actual query results
-Put each data point on its own line
-Ensure all currency values are represented in Indian Rupees (₹)
-Keep language simple, clear, and professional
-Be concise but insightful
-IMPORTANT: Change the first heading based on the actual data type (e.g., "Revenue Analysis", "Customer Analysis", "Profit Analysis", "Expense Summary", etc.)
-
-RESPONSE STRUCTURE:
-[Dynamic Heading Based on Query Data - e.g., Revenue Analysis/Customer Summary/Expense Overview/etc.]
-[Write 2-3 sentences summarizing the key findings in simple terms from a CA perspective]
-Key Numbers
-[Present the main data points using bullet format with ▸]
-Recommendations
-[Provide 2-3 brief, practical suggestions based on the data]
-EXAMPLE FORMAT (DO NOT USE THIS DATA):
-Revenue Analysis
-Revenue shows high volatility with June 2024 hitting ₹1,58,60,76,44.80 but dropping significantly in March 2025 to ₹10,17,37,403.41. This irregular pattern indicates dependency on large orders and needs better planning.
-Key Numbers
-▸ Highest Revenue: ₹1,58,60,76,44.80 (June 2024)
-▸ Latest Revenue: ₹10,17,37,403.41 (March 2025)
-▸ Revenue Drop: 93% decline from peak
-Recommendations
-Focus on building steady monthly sales rather than depending on big orders. Set up better cash flow planning for tax payments during high-revenue months. Consider customer diversification to reduce business risk.
-    END OF EXAMPLE - NOW USE ACTUAL DATA BELOW:
+    CRITICAL FORMATTING RULES:
+    Always use this exact bullet point format: "▸ " followed by a space (e.g., ▸ Total Active Customers: 397)
+    Do not use markdown symbols like *, **, -, or #
+    Format all numbers with commas (e.g., 1,000 not 1000)
+    Use clear section headings that are relevant to the actual query results
+    Put each data point on its own line
+    Ensure all currency values are represented in Indian Rupees (₹)
+    Keep language simple, clear, and professional
+    Be concise but insightful
 
     User Question: {user_question}
 
@@ -1634,50 +1636,146 @@ Focus on building steady monthly sales rather than depending on big orders. Set 
 
     Column Names: {column_names}
 
-    IMPORTANT: Generate your response using ONLY the actual query results provided above. Do not use the example data. Create appropriate section headings based on the real query topic. Analyze the real data and provide insights relevant to the actual business question asked.
+    Generate your response using ONLY the actual query results provided above.
     """
-            
+        
+        try:
             response = self.client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
                     {
                         "role": "system", 
                         "content": """You are a professional data analyst that explains query results in clear, 
-                        business-appropriate language formatted for a specific frontend UI. 
-
-                        CRITICAL REQUIREMENTS:
-                        1. Always use "▸ " (with space) for bullet points - never use -, *, or **
-                        2. Never use markdown formatting
-                        3. Format numbers with commas (e.g., 1,000)
-                        4. Create section headings relevant to the actual query topic
-                        5. Start with "Key Insights" paragraph analyzing real data
-                        6. Follow with "Analysis of [Actual Topic]" using bullet points
-                        7. Base ALL content on the actual query results provided
-                        8. Do not reference or use any example data shown in the prompt
-                        9. Keep formatting consistent and professional
-                        10. Ensure proper spacing between sections"""
+                        business-appropriate language formatted for a specific frontend UI."""
                     },
                     {
                         "role": "user", 
                         "content": prompt
                     }
                 ],
-                temperature=0.2,  # Lower temperature for more consistent formatting
+                temperature=0.2,
                 max_tokens=2000
             )
             
-            # Post-process the response to ensure perfect formatting
             answer = response.choices[0].message.content
-            
-            # Clean up any accidental markdown and formatting issues
-            answer = self._clean_response_formatting(answer)
-            
-            return answer
+            return self._clean_response_formatting(answer)
             
         except Exception as e:
-            logger.error(f"Error in generate_final_answer: {e}")
-            return f"An error occurred while generating the answer: {str(e)}"
+            logger.error(f"Error in _generate_direct_answer: {e}")
+            return f"Error generating response: {str(e)}"
 
+    def _generate_chunked_answer(self, user_question: str, query: str, query_results: List[Dict], column_names: List[str]) -> str:
+        """Generate answer for large datasets using chunking and summarization."""
+        logger.info(f"Starting chunked summarization for {len(query_results)} rows")
+        
+        # Split data into manageable chunks (adjust chunk_size based on your data complexity)
+        chunk_size = 300  # Smaller chunks for safety
+        chunks = [query_results[i:i + chunk_size] for i in range(0, len(query_results), chunk_size)]
+        
+        logger.info(f"Split into {len(chunks)} chunks of {chunk_size} rows each")
+        
+        # Summarize each chunk
+        chunk_summaries = []
+        for i, chunk in enumerate(chunks):
+            logger.info(f"Processing chunk {i+1}/{len(chunks)}")
+            chunk_summary = self._summarize_chunk(user_question, query, chunk, column_names, i+1, len(chunks))
+            chunk_summaries.append(chunk_summary)
+            
+            # Add small delay to avoid rate limits
+            time.sleep(0.5)
+        
+        # Generate final summary from chunk summaries
+        final_summary = self._generate_final_summary(user_question, query, chunk_summaries, len(query_results))
+        
+        return final_summary
+
+    def _summarize_chunk(self, user_question: str, query: str, chunk_data: List[Dict], column_names: List[str], 
+                        chunk_number: int, total_chunks: int) -> str:
+        """Summarize a single chunk of data."""
+        chunk_str = json.dumps({
+            "query_results": chunk_data,
+            "column_names": column_names
+        }, indent=2, cls=CustomJSONEncoder)
+        
+        prompt = f"""
+    You are summarizing a portion of a large dataset for PowerParts Private Ltd.
+    This is chunk {chunk_number} of {total_chunks}. Focus on key patterns, trends, and important numbers.
+
+    User Question: {user_question}
+    SQL Query: {query}
+
+    Data Chunk {chunk_number}/{total_chunks}:
+    {chunk_str}
+
+    Provide a concise summary of this data chunk focusing on:
+    1. Key numerical values and their significance
+    2. Notable patterns or trends
+    3. Any outliers or exceptional values
+    4. Business implications specific to this chunk
+
+    Keep your summary focused and factual. Return ONLY the summary text.
+    """
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You summarize data chunks concisely and accurately."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=500  # Shorter responses for chunks
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            logger.error(f"Error summarizing chunk {chunk_number}: {e}")
+            return f"Summary unavailable for chunk {chunk_number} due to error."
+
+    def _generate_final_summary(self, user_question: str, query: str, chunk_summaries: List[str], total_rows: int) -> str:
+        """Generate final summary from chunk summaries."""
+        all_summaries = "\n\n".join([f"Chunk {i+1} Summary:\n{summary}" for i, summary in enumerate(chunk_summaries)])
+        
+        prompt = f"""
+    You are a professional Chartered Accountant and financial analyst for PowerParts Private Ltd.
+    Based on the user question and summaries of all data chunks, generate a comprehensive final analysis.
+
+    User Question: {user_question}
+    SQL Query: {query}
+    Total Rows Analyzed: {total_rows:,}
+
+    Chunk Summaries:
+    {all_summaries}
+
+    Generate a professional summary that:
+    1. Synthesizes insights from all chunk summaries
+    2. Provides overall trends and patterns
+    3. Highlights key business implications
+    4. Uses proper formatting with "▸ " bullet points
+    5. Includes recommendations based on the complete dataset
+
+    Follow the same formatting rules as the direct analysis method.
+    """
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You synthesize chunk summaries into comprehensive analyses."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=2000
+            )
+            
+            answer = response.choices[0].message.content
+            return self._clean_response_formatting(answer)
+            
+        except Exception as e:
+            logger.error(f"Error generating final summary: {e}")
+            # Fallback: return concatenated chunk summaries
+            return f"Comprehensive analysis of {total_rows:,} rows:\n\n" + "\n\n".join(chunk_summaries)
     def _clean_response_formatting(self, answer: str) -> str:
         """Clean and standardize the response formatting."""
         # Remove all markdown formatting
