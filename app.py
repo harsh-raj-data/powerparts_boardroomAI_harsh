@@ -27,6 +27,7 @@ from decimal import Decimal
 import hashlib
 import re
 from dotenv import load_dotenv
+import requests
 
 load_dotenv()
 
@@ -49,14 +50,12 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 # Templates configuration
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
-
 # In-memory storage for query results
 query_cache = {}
 query_results = {}
 query_lock = threading.Lock()
 
 # Database Configuration
-# Database Configuration from environment variables
 DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
     "port": int(os.getenv("DB_PORT", 3306)),
@@ -66,7 +65,7 @@ DB_CONFIG = {
     'use_pure': True
 }
 
-# History Database Configuration from environment variables
+# History Database Configuration
 HISTORY_DB_CONFIG = {
     "host": os.getenv("HISTORY_DB_HOST"),
     "port": int(os.getenv("HISTORY_DB_PORT", 3306)),
@@ -76,11 +75,12 @@ HISTORY_DB_CONFIG = {
     'use_pure': True
 }
 
-
-
-# OpenAI Configuration from environment variables
+# API Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = "gpt-4-turbo-preview"  
+OPENAI_MODEL = "gpt-4-turbo-preview"
+OLLAMA_API_URL = os.getenv("API_URL", "http://localhost:11434/api/chat")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:latest")
+API_KEY = os.getenv("API_KEY", "super-secret-key")
 
 # Schema definition
 TABLE_SCHEMAS = {
@@ -226,7 +226,7 @@ class UserManager:
     def __init__(self):
         self.connection = None
         self.setup_connection()
-        
+    
     def setup_connection(self):
         """Establish connection to history database."""
         try:
@@ -236,7 +236,7 @@ class UserManager:
                 self._create_tables_if_not_exist()
         except Error as e:
             logger.error(f"Error connecting to user database: {e}")
-            
+    
     def _create_tables_if_not_exist(self):
         """Create required tables if they don't exist."""
         create_users_table = """
@@ -257,12 +257,12 @@ class UserManager:
             cursor.close()
         except Error as e:
             logger.error(f"Error creating users table: {e}")
-            
+    
     def register_user(self, email: str, name: str, password: str) -> bool:
         """Register a new user with email and password."""
         if not email or not password or not name:
             return False
-            
+        
         try:
             # Simple password hashing (in production, use proper hashing like bcrypt)
             password_hash = hashlib.sha256(password.encode()).hexdigest()
@@ -284,18 +284,18 @@ class UserManager:
         except Error as e:
             logger.error(f"Error registering user: {e}")
             return False
-            
+    
     def authenticate_user(self, email: str, password: str) -> Optional[Dict]:
         """Authenticate a user and return user data if successful."""
         if not email or not password:
             return None
-            
+        
         try:
             password_hash = hashlib.sha256(password.encode()).hexdigest()
             
             cursor = self.connection.cursor(dictionary=True)
             select_query = """
-            SELECT id, email, name FROM users 
+            SELECT id, email, name FROM users
             WHERE email = %s AND password_hash = %s
             """
             cursor.execute(select_query, (email, password_hash))
@@ -305,7 +305,7 @@ class UserManager:
             if user:
                 # Update last login time
                 update_query = """
-                UPDATE users SET last_login = CURRENT_TIMESTAMP 
+                UPDATE users SET last_login = CURRENT_TIMESTAMP
                 WHERE id = %s
                 """
                 cursor = self.connection.cursor()
@@ -313,11 +313,11 @@ class UserManager:
                 self.connection.commit()
                 cursor.close()
                 
-            return user
+                return user
         except Error as e:
             logger.error(f"Error authenticating user: {e}")
             return None
-            
+    
     def close_connection(self):
         """Close the database connection."""
         if self.connection and self.connection.is_connected():
@@ -331,7 +331,7 @@ class CustomJSONEncoder(json.JSONEncoder):
         if isinstance(obj, Decimal):
             return float(obj)
         return super().default(obj)
-    
+
 class VectorStoreManager:
     """Handles loading and querying the vector store for data context."""
     
@@ -340,7 +340,7 @@ class VectorStoreManager:
         self.embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
         self.vector_store = None
         self.text_chunks = None
-        
+    
     def load_vector_store(self, index_path: str, chunks_path: str):
         """Load the FAISS vector store and text chunks."""
         try:
@@ -351,15 +351,15 @@ class VectorStoreManager:
             if not Path(chunks_path).exists():
                 logger.error(f"Text chunks file not found at {chunks_path}")
                 return False
-                
+            
             # Load the text chunks
             with open(chunks_path, 'rb') as f:
                 self.text_chunks = pickle.load(f)
-                
+            
             # Load the FAISS index - use the embeddings we initialized in __init__
             self.vector_store = FAISS.load_local(
                 folder_path=str(Path(index_path).parent),
-                embeddings=self.embeddings,  # This should now work
+                embeddings=self.embeddings, # This should now work
                 index_name=Path(index_path).stem,
                 allow_dangerous_deserialization=True
             )
@@ -375,22 +375,22 @@ class ConversationContext:
     def __init__(self):
         self.context_stack = []
         self.max_context_length = 5
-        self.last_query_results = None  # New field to store last query results
-        
+        self.last_query_results = None # New field to store last query results
+    
     def add_context(self, question: str, answer: str, sql_query: str = None, query_results: List[Dict] = None):
         """Add a new Q&A pair to the context stack."""
         context = {
             "question": question,
             "answer": answer,
             "sql_query": sql_query,
-            "query_results": query_results,  # Store the actual data
+            "query_results": query_results, # Store the actual data
             "timestamp": datetime.now().isoformat()
         }
         self.context_stack.append(context)
         if len(self.context_stack) > self.max_context_length:
             self.context_stack.pop(0)
-        self.last_query_results = query_results  # Update last results
-            
+        self.last_query_results = query_results # Update last results
+    
     def get_relevant_context(self, new_question: str) -> str:
         """Get the most relevant context for a new question."""
         if not self.context_stack:
@@ -404,7 +404,7 @@ class ConversationContext:
             try:
                 # Extract key numerical values from previous results
                 data_summary = []
-                for row in last_context['query_results'][:3]:  # Just first few rows
+                for row in last_context['query_results'][:3]: # Just first few rows
                     for k, v in row.items():
                         if isinstance(v, (int, float)):
                             data_summary.append(f"{k}: {v}")
@@ -417,7 +417,7 @@ class ConversationContext:
                 logger.error(f"Error summarizing previous query results: {e}")
         
         return context_str
-        
+    
     def clear_context(self):
         """Clear the conversation context."""
         self.context_stack = []
@@ -429,7 +429,7 @@ class ChatHistoryManager:
     def __init__(self):
         self.connection = None
         self.setup_connection()
-        
+    
     def setup_connection(self):
         """Establish connection to history database."""
         try:
@@ -439,7 +439,7 @@ class ChatHistoryManager:
                 self._create_table_if_not_exists()
         except Error as e:
             logger.error(f"Error connecting to history database: {e}")
-            
+    
     def _create_table_if_not_exists(self):
         """Create the chat_history table if it doesn't exist."""
         create_table_query = """
@@ -461,12 +461,12 @@ class ChatHistoryManager:
             cursor.close()
         except Error as e:
             logger.error(f"Error creating chat_history table: {e}")
-            
+    
     def save_to_history(self, user_id: str, query_id: str, question: str, answer: str, sql_query: str = None):
         """Save a chat interaction to the database."""
         if not self.connection or not self.connection.is_connected():
             self.setup_connection()
-            
+        
         try:
             cursor = self.connection.cursor()
             insert_query = """
@@ -478,7 +478,7 @@ class ChatHistoryManager:
                 user_id,
                 query_id,
                 question,
-                answer,  # Now saving both question and answer
+                answer, # Now saving both question and answer
                 sql_query
             ))
             self.connection.commit()
@@ -486,12 +486,12 @@ class ChatHistoryManager:
             logger.info("Chat history saved to database")
         except Error as e:
             logger.error(f"Error saving chat history: {e}")
-            
+    
     def get_user_history(self, user_id: str, limit: int = 50) -> List[Dict]:
         """Retrieve chat history for a specific user."""
         if not self.connection or not self.connection.is_connected():
             self.setup_connection()
-            
+        
         try:
             cursor = self.connection.cursor(dictionary=True)
             select_query = """
@@ -516,12 +516,12 @@ class ChatHistoryManager:
                     "sql_query": item["sql_query"],
                     "timestamp": item["created_at"].isoformat() if item["created_at"] else None
                 })
-                
+            
             return formatted_history
         except Error as e:
             logger.error(f"Error fetching user history: {e}")
             return []
-            
+    
     def close_connection(self):
         """Close the database connection."""
         if self.connection and self.connection.is_connected():
@@ -530,18 +530,18 @@ class ChatHistoryManager:
 
 class FollowUpHandler:
     """Handles follow-up question detection and processing."""
-
+    
     def __init__(self, rag_system: 'PowerPartsRAGSystem'):
         self.rag_system = rag_system
         self.conversation_context = ConversationContext()
-
+    
     def is_follow_up(self, question: str) -> bool:
         """Determine if a question is a follow-up to the previous conversation."""
         if not self.conversation_context.context_stack:
             return False
-
+        
         question_clean = question.strip().lower()
-
+        
         # Filter out greetings or unrelated small talk
         greeting_phrases = [
             'hello', 'hi', 'hey', 'good morning', 'good evening',
@@ -549,7 +549,7 @@ class FollowUpHandler:
         ]
         if any(greet in question_clean for greet in greeting_phrases) and len(question_clean.split()) <= 5:
             return False
-
+        
         # Check for explicit follow-up words
         follow_up_words = [
             'then', 'also', 'what about', 'how about', 'after', 'following',
@@ -557,32 +557,31 @@ class FollowUpHandler:
         ]
         if any(word in question_clean for word in follow_up_words):
             return True
-
+        
         # Get the last context
         last_context = self.conversation_context.context_stack[-1]
-
+        
         prompt = f"""
-You are an assistant that detects whether a new user query is a follow-up to a previous question.
+        You are an assistant that detects whether a new user query is a follow-up to a previous question.
 
-Only answer "yes" or "no".
+        Only answer "yes" or "no".
 
-Do NOT classify greetings or general chat (like "hello", "thank you", "good evening") as follow-ups.
+        Do NOT classify greetings or general chat (like "hello", "thank you", "good evening") as follow-ups.
 
-Previous Question: {last_context['question']}
-Previous Answer Summary: {last_context['answer'][:300]}...
-Previous Data Summary: {self._summarize_data(last_context.get('query_results'))}
+        Previous Question: {last_context['question']}
+        Previous Answer Summary: {last_context['answer'][:300]}...
+        Previous Data Summary: {self._summarize_data(last_context.get('query_results'))}
 
-New Question: {question}
+        New Question: {question}
 
-Only say "yes" if the new question:
-1. Clearly builds upon the data, intent, or scope of the previous interaction.
-2. Requests analysis, extension, or clarification of previous results.
-3. Is NOT a general greeting or a completely unrelated standalone question.
-"""
-
+        Only say "yes" if the new question:
+        1. Clearly builds upon the data, intent, or scope of the previous interaction.
+        2. Requests analysis, extension, or clarification of previous results.
+        3. Is NOT a general greeting or a completely unrelated standalone question.
+        """
+        
         try:
-            response = self.rag_system.client.chat.completions.create(
-                model=OPENAI_MODEL,
+            response = self.rag_system.call_llm_api(
                 messages=[
                     {"role": "system", "content": "You are a follow-up question detector."},
                     {"role": "user", "content": prompt}
@@ -590,18 +589,18 @@ Only say "yes" if the new question:
                 temperature=0.1,
                 max_tokens=10
             )
-            return response.choices[0].message.content.strip().lower() == 'yes'
+            return response.lower().strip() == 'yes'
         except Exception as e:
             logger.error(f"Error in is_follow_up: {e}")
             return False
-
+    
     def _summarize_data(self, query_results: Optional[List[Dict]]) -> str:
         """Summarize query results for context."""
         if not query_results:
             return "No data available"
-
+        
         summary = []
-        for row in query_results[:3]:  # Only first few rows
+        for row in query_results[:3]: # Only first few rows
             row_summary = []
             for k, v in row.items():
                 if isinstance(v, (int, float)):
@@ -610,32 +609,31 @@ Only say "yes" if the new question:
                     row_summary.append(f"{k}: {float(v):.2f}")
             if row_summary:
                 summary.append(", ".join(row_summary))
-
+        
         return "\n".join(summary) if summary else "No numerical data available"
-
+    
     def rewrite_follow_up(self, question: str) -> str:
         """Rewrite a follow-up question to include relevant context."""
         context = self.conversation_context.get_relevant_context(question)
-
+        
         prompt = f"""
-Rewrite the follow-up question to be standalone while preserving intent.
-Return ONLY the rewritten question.
+        Rewrite the follow-up question to be standalone while preserving intent.
+        Return ONLY the rewritten question.
 
-Conversation Context:
-{context}
+        Conversation Context:
+        {context}
 
-Follow-up Question: {question}
+        Follow-up Question: {question}
 
-Guidelines:
-- If the question references previous numbers/data, include those values
-- Keep all business terms and technical names unchanged
-- Maintain the original intent and tone
-- Do not rewrite if it's a greeting or off-topic message — just return as-is
-"""
-
+        Guidelines:
+        - If the question references previous numbers/data, include those values
+        - Keep all business terms and technical names unchanged
+        - Maintain the original intent and tone
+        - Do not rewrite if it's a greeting or off-topic message — just return as-is
+        """
+        
         try:
-            response = self.rag_system.client.chat.completions.create(
-                model=OPENAI_MODEL,
+            response = self.rag_system.call_llm_api(
                 messages=[
                     {"role": "system", "content": "You rewrite follow-up questions to include necessary context."},
                     {"role": "user", "content": prompt}
@@ -643,7 +641,7 @@ Guidelines:
                 temperature=0.3,
                 max_tokens=200
             )
-            return response.choices[0].message.content.strip()
+            return response.strip()
         except Exception as e:
             logger.error(f"Error in rewrite_follow_up: {e}")
             return question
@@ -662,8 +660,7 @@ class PowerPartsRAGSystem:
         self.follow_up_handler = FollowUpHandler(self)
         self.history_manager = ChatHistoryManager()
         self.user_manager = UserManager()
-        
-        
+    
     def setup_db_connection(self):
         """Establish a connection to the MySQL database."""
         try:
@@ -673,14 +670,62 @@ class PowerPartsRAGSystem:
         except Error as e:
             logger.error(f"Error while connecting to MySQL: {e}")
             raise
-
+    
     def close_db_connection(self):
         """Close the database connection if it exists."""
         if self.db_connection and self.db_connection.is_connected():
             self.db_connection.close()
             logger.info("MySQL connection closed")
-
-
+    
+    def call_llm_api(self, messages, temperature=0.7, max_tokens=1000, response_format=None):
+        """
+        Call LLM API, trying Ollama first and falling back to OpenAI if needed.
+        """
+        # Try Ollama first
+        try:
+            logger.info("Trying Ollama API...")
+            ollama_data = {
+                "model": OLLAMA_MODEL,
+                "messages": messages,
+                "stream": False,
+                "options": {
+                    "temperature": temperature,
+                    "num_predict": max_tokens
+                }
+            }
+            
+            headers = {"Authorization": f"Bearer {API_KEY}"}
+            response = requests.post(OLLAMA_API_URL, json=ollama_data, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result["message"]["content"]
+            else:
+                logger.warning(f"Ollama API returned status {response.status_code}: {response.text}")
+                raise Exception(f"Ollama API error: {response.status_code}")
+                
+        except Exception as e:
+            logger.warning(f"Ollama API failed, falling back to OpenAI: {e}")
+            
+            # Fall back to OpenAI
+            try:
+                logger.info("Using OpenAI API as fallback...")
+                openai_params = {
+                    "model": OPENAI_MODEL,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens
+                }
+                
+                if response_format:
+                    openai_params["response_format"] = response_format
+                
+                response = self.client.chat.completions.create(**openai_params)
+                return response.choices[0].message.content
+            except Exception as openai_error:
+                logger.error(f"OpenAI API also failed: {openai_error}")
+                raise Exception(f"Both Ollama and OpenAI APIs failed: {openai_error}")
+    
     def classify_question(self, user_question: str) -> str:
         """
         Classify the user's question as either 'greeting' or 'analytical'.
@@ -688,44 +733,43 @@ class PowerPartsRAGSystem:
         """
         prompt = f"""
         Classify the following user question as either 'greeting' or 'analytical':
-        
+
         1. 'greeting' - If the question is a greeting, introduction, small talk, or doesn't require data analysis.
-           Examples: 
-           - "Hi there"
-           - "Who are you?"
-           - "What can you do?"
-           - "How are you?"
-           - "Tell me about yourself"
-           - "Good morning"
-           - "Thanks for your help"
-           - "Hello"
-           - "Good afternoon"
-           - "What's up?"
-           - "Can you help me?"
-           - "What is this system about?"
-           - "Explain what you do"
-           - "Tell me about yourself"
-           - "Tell me something about you"
-        
+        Examples:
+        - "Hi there"
+        - "Who are you?"
+        - "What can you do?"
+        - "How are you?"
+        - "Tell me about yourself"
+        - "Good morning"
+        - "Thanks for your help"
+        - "Hello"
+        - "Good afternoon"
+        - "What's up?"
+        - "Can you help me?"
+        - "What is this system about?"
+        - "Explain what you do"
+        - "Tell me about yourself"
+        - "Tell me something about you"
+
         2. 'analytical' - If the question requires data analysis, database querying, or business insights.
-           Examples:
-           - "Show me sales trends"
-           - "What's our dead inventory value?"
-           - "List active AMCs in Kolkata"
-           - "Compare sales between regions"
-           - "What parts are in model XYZ?"
-           - "Give me inventory data"
-           - "Show AMC status distribution"
-           - "Analyze sales performance"
-        
+        Examples:
+        - "Show me sales trends"
+        - "What's our dead inventory value?"
+        - "List active AMCs in Kolkata"
+        - "Compare sales between regions"
+        - "What parts are in model XYZ?"
+        - "Give me inventory data"
+        - "Show AMC status distribution"
+        - "Analyze sales performance"
+
         User Question: {user_question}
-        
+
         Respond ONLY with either 'greeting' or 'analytical'. No other text or explanation.
         """
         
         try:
-            response = self.client.chat.completions.create(
-                model=OPENAI_MODEL,
+            response = self.call_llm_api(
                 messages=[
                     {"role": "system", "content": "You are a question classifier that determines if a question is a greeting or requires data analysis."},
                     {"role": "user", "content": prompt}
@@ -734,13 +778,13 @@ class PowerPartsRAGSystem:
                 max_tokens=10
             )
             
-            classification = response.choices[0].message.content.lower().strip()
+            classification = response.lower().strip()
             return classification if classification in ['greeting', 'analytical'] else 'analytical'
-            
+        
         except Exception as e:
             logger.error(f"Error in classify_question: {e}")
-            return 'analytical'  # Default to analytical if classification fails
-
+            return 'analytical' # Default to analytical if classification fails
+    
     def generate_greeting_response(self, user_question: str) -> str:
         """Generate a professional greeting response based on the user's input."""
         prompt = f"""
@@ -751,20 +795,19 @@ class PowerPartsRAGSystem:
         3. Guides the user toward asking data-related questions
         4. Maintains a professional tone
         5. Is concise (3-5 sentences max)
-        
+
         User's input: {user_question}
-        
+
         Example responses:
         - "Hello! I'm your Power Parts data assistant. I can help analyze inventory, sales, AMCs, and more. How can I assist you today?"
         - "Good morning! I specialize in Power Parts business data analysis. I can provide insights on inventory, sales, and contracts. What would you like to explore?"
         - "Thanks for reaching out! I'm here to help with Power Parts data queries. I can analyze trends, generate reports, and answer business questions. What information do you need?"
-        
+
         Respond in a similar professional but friendly style based on the user's input.
         """
         
         try:
-            response = self.client.chat.completions.create(
-                model=OPENAI_MODEL,
+            response = self.call_llm_api(
                 messages=[
                     {"role": "system", "content": "You are a professional AI assistant for Power Parts Private Limited that handles greetings and introductory questions."},
                     {"role": "user", "content": prompt}
@@ -773,14 +816,14 @@ class PowerPartsRAGSystem:
                 max_tokens=150
             )
             
-            return response.choices[0].message.content
-            
+            return response
+        
         except Exception as e:
             logger.error(f"Error in generate_greeting_response: {e}")
             return "Hello! I'm your Power Parts data assistant. How can I help you today?"
-
+    
     def get_table_rankings(self, user_question: str) -> List[Dict]:
-        """Use OpenAI to analyze the user's question and rank relevant tables."""
+        """Use LLM to analyze the user's question and rank relevant tables."""
         schema_str = json.dumps(TABLE_SCHEMAS, indent=2)
         
         prompt = f"""
@@ -794,16 +837,15 @@ class PowerPartsRAGSystem:
 
         Example Response:
         {{
-            "tables": [
-                {{"table_name": "sales_invoice_details", "relevance_score": 9}},
-                {{"table_name": "dead_inventory_merge", "relevance_score": 5}}
-            ]
+        "tables": [
+            {{"table_name": "sales_invoice_details", "relevance_score": 9}},
+            {{"table_name": "dead_inventory_merge", "relevance_score": 5}}
+        ]
         }}
         """
         
         try:
-            response = self.client.chat.completions.create(
-                model=OPENAI_MODEL,
+            response = self.call_llm_api(
                 messages=[
                     {"role": "system", "content": "You are a database expert that analyzes questions and determines which tables are most relevant."},
                     {"role": "user", "content": prompt}
@@ -812,13 +854,13 @@ class PowerPartsRAGSystem:
                 response_format={"type": "json_object"}
             )
             
-            result = json.loads(response.choices[0].message.content)
+            result = json.loads(response)
             return result.get("tables", [])
-            
+        
         except Exception as e:
             logger.error(f"Error in get_table_rankings: {e}")
             return []
-
+    
     def clean_sql_query(self, query: str) -> str:
         """Clean the SQL query by removing markdown code blocks and other non-SQL text."""
         # Remove markdown code blocks
@@ -828,7 +870,7 @@ class PowerPartsRAGSystem:
         # Remove semicolons if present (they can cause issues with some MySQL connectors)
         query = query.rstrip(';')
         return query
-
+    
     def generate_sql_query(self, user_question: str, relevant_tables: List[str]) -> str:
         """Generate a SQL query based on the user's question and relevant tables."""
         # Get schema information for the relevant tables
@@ -840,8 +882,8 @@ class PowerPartsRAGSystem:
                     "description": TABLE_SCHEMAS[table]["description"],
                     "columns": TABLE_SCHEMAS[table]["columns"]
                 })
-
-        prompt = f"""
+        
+        prompt =  f"""
 You are an expert MySQL query generator for PowerParts Private Ltd's database system. Generate ONLY precise, correct SQL queries based on actual data patterns and business context.
 
 CRITICAL DATA PATTERN ANALYSIS FROM ACTUAL DATA:
@@ -940,7 +982,7 @@ CRITICAL DATA PATTERN ANALYSIS FROM ACTUAL DATA:
     - part_number: Standard part identifiers
     - engine_prefix_number: Links to engine compatibility (matches other tables)
 
-    
+   
 CRITICAL CORRECTIONS TO COMMON MISTAKES
 
 1. Engine Family Filtering Rules
@@ -961,19 +1003,19 @@ CRITICAL CORRECTIONS TO COMMON MISTAKES
 4. Best Selling Model/Engine Queries
 - WRONG: Query sales_invoice_details for engine models
 - CORRECT: Use engine_sales_records table for engine model analysis
-- CORRECT QUERY: 
-SELECT model_number, COUNT(*) 
-FROM engine_sales_records 
-GROUP BY model_number 
-ORDER BY COUNT(*) DESC 
+- CORRECT QUERY:
+SELECT model_number, COUNT(*)
+FROM engine_sales_records
+GROUP BY model_number
+ORDER BY COUNT(*) DESC
 LIMIT 1
 
 5. Engine Sales Count Queries
 - WRONG: Use sales_invoice_details for engine counts
 - CORRECT: Use engine_sales_records table directly for engine counts
-- CORRECT QUERY: 
-SELECT COUNT(*) 
-FROM engine_sales_records 
+- CORRECT QUERY:
+SELECT COUNT(*)
+FROM engine_sales_records
 WHERE YEAR(in_service_date) = 2024
 
 6. Dead Inventory Value Calculations
@@ -986,9 +1028,9 @@ WHERE YEAR(in_service_date) = 2024
 - WRONG: Count all records without considering unique customers
 - CORRECT CUSTOMER-LEVEL CALCULATION:
 SELECT ROUND(
-    (COUNT(DISTINCT CASE 
-        WHEN amc_status IN ('Active', 'Under Renewal') THEN customer_name 
-    END) / COUNT(DISTINCT customer_name)) * 100, 
+    (COUNT(DISTINCT CASE
+        WHEN amc_status IN ('Active', 'Under Renewal') THEN customer_name
+    END) / COUNT(DISTINCT customer_name)) * 100,
 2) AS percentage_of_customers_with_active_amcs
 FROM annual_maintainance_contracts_merge;
 
@@ -1005,48 +1047,48 @@ FROM annual_maintainance_contracts_merge;
 FIXED QUERY PATTERNS FOR COMMON BUSINESS QUESTIONS
 
 1. Total Engines Sold in Year
-SELECT COUNT(*) 
-FROM engine_sales_records 
+SELECT COUNT(*)
+FROM engine_sales_records
 WHERE YEAR(in_service_date) = 2024
 
 2. Segment Distribution
-SELECT customer_segment, COUNT(*) 
-FROM engine_sales_records 
+SELECT customer_segment, COUNT(*)
+FROM engine_sales_records
 GROUP BY customer_segment
 
 3. Government Sector Engines
-SELECT COUNT(*) 
-FROM engine_sales_records 
+SELECT COUNT(*)
+FROM engine_sales_records
 WHERE customer_segment = 'GOVERNMENT SECTOR'
 
 4. Best Selling Engine Model
-SELECT model_number, COUNT(*) 
-FROM engine_sales_records 
-GROUP BY model_number 
-ORDER BY COUNT(*) DESC 
+SELECT model_number, COUNT(*)
+FROM engine_sales_records
+GROUP BY model_number
+ORDER BY COUNT(*) DESC
 LIMIT 1
 
 5. Top Dead Inventory by Value
-SELECT part_number, part_name, (market_value * stock_quantity) as total_value 
-FROM dead_inventory_merge 
-ORDER BY total_value DESC 
+SELECT part_number, part_name, (market_value * stock_quantity) as total_value
+FROM dead_inventory_merge
+ORDER BY total_value DESC
 LIMIT 5
 
 6. Inventory Amount by Location
-SELECT SUM(market_value * stock_quantity) 
-FROM dead_inventory_merge 
+SELECT SUM(market_value * stock_quantity)
+FROM dead_inventory_merge
 WHERE region_name = 'Kolkata'
 
 7. AMC Renewal Rate
 SELECT ROUND(
-    (COUNT(CASE WHEN amc_status IN ('Active', 'Under Renewal') THEN 1 END) / COUNT(*)) * 100, 
+    (COUNT(CASE WHEN amc_status IN ('Active', 'Under Renewal') THEN 1 END) / COUNT(*)) * 100,
     2
-) as renewal_rate_percent 
+) as renewal_rate_percent
 FROM annual_maintainance_contracts_merge
 
 8. Expired AMCs
-SELECT customer_name 
-FROM annual_maintainance_contracts_merge 
+SELECT customer_name
+FROM annual_maintainance_contracts_merge
 WHERE amc_expiry_date < CURDATE()
 
 9. Parts Below Minimum Stock with Last Restock Date
@@ -1077,20 +1119,20 @@ WHERE amc_expiry_date < CURDATE()
 
     FIXED QUERY PATTERN:
 
-    SELECT 
-        di.part_number, 
-        di.part_name, 
-        di.stock_quantity, 
-        MAX(sid.invoice_date) AS last_restock_date 
-    FROM 
-        dead_inventory_merge di 
-    LEFT JOIN 
-        sales_invoice_details sid ON di.part_number = sid.part_number 
-    WHERE 
-        di.stock_quantity < 10 
-    GROUP BY 
-        di.part_number, di.part_name, di.stock_quantity 
-    ORDER BY 
+    SELECT
+        di.part_number,
+        di.part_name,
+        di.stock_quantity,
+        MAX(sid.invoice_date) AS last_restock_date
+    FROM
+        dead_inventory_merge di
+    LEFT JOIN
+        sales_invoice_details sid ON di.part_number = sid.part_number
+    WHERE
+        di.stock_quantity < 10
+    GROUP BY
+        di.part_number, di.part_name, di.stock_quantity
+    ORDER BY
         di.stock_quantity ASC;
 
 Parts Demand Forecasting with Value Projections
@@ -1115,10 +1157,10 @@ Parts Demand Forecasting with Value Projections
     INVENTORY RECOMMENDATIONS: Provide actionable insights like 'High Growth - Stock Up', 'Declining - Reduce Stock', 'Stable - Maintain Current Levels' based on growth patterns.
     RESULT ORDERING: Sort by historical_value_12m DESC and LIMIT to top 20 parts to focus on most valuable items for business impact.
 
-    FIXED QUERY PATTERN: 
+    FIXED QUERY PATTERN:
 
 WITH monthly_sales AS (
-    SELECT 
+    SELECT
         sid.part_number,
         sid.part_name,
         YEAR(sid.invoice_date) as sales_year,
@@ -1128,16 +1170,16 @@ WITH monthly_sales AS (
         AVG(sid.unit_price) as avg_unit_price,
         COUNT(DISTINCT sid.invoice_customer_name) as monthly_customers
     FROM sales_invoice_details sid
-    WHERE 
+    WHERE
         sid.invoice_date >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
-        AND sid.part_number IS NOT NULL 
+        AND sid.part_number IS NOT NULL
         AND sid.part_number != ''
         AND (sid.invoice_type LIKE '%Parts%' OR sid.invoice_type LIKE '%Engine%')
     GROUP BY sid.part_number, sid.part_name, YEAR(sid.invoice_date), MONTH(sid.invoice_date)
 ),
 
 parts_trend_analysis AS (
-    SELECT 
+    SELECT
         part_number,
         part_name,
         -- Historical Performance (Last 12 months)
@@ -1148,51 +1190,51 @@ parts_trend_analysis AS (
         AVG(avg_unit_price) as avg_unit_price,
         COUNT(DISTINCT CONCAT(sales_year, '-', sales_month)) as active_months,
         SUM(monthly_customers) as total_customer_interactions,
-        
+       
         -- Trend Calculations (Simple Linear Trend)
         -- Recent 6 months vs Previous 6 months growth
-        SUM(CASE WHEN STR_TO_DATE(CONCAT(sales_year, '-', sales_month, '-01'), '%Y-%m-%d') 
-                      >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH) 
+        SUM(CASE WHEN STR_TO_DATE(CONCAT(sales_year, '-', sales_month, '-01'), '%Y-%m-%d')
+                      >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
                  THEN monthly_quantity ELSE 0 END) as recent_6m_quantity,
-        SUM(CASE WHEN STR_TO_DATE(CONCAT(sales_year, '-', sales_month, '-01'), '%Y-%m-%d') 
-                      < DATE_SUB(CURDATE(), INTERVAL 6 MONTH) 
+        SUM(CASE WHEN STR_TO_DATE(CONCAT(sales_year, '-', sales_month, '-01'), '%Y-%m-%d')
+                      < DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
                  THEN monthly_quantity ELSE 0 END) as previous_6m_quantity,
                  
-        SUM(CASE WHEN STR_TO_DATE(CONCAT(sales_year, '-', sales_month, '-01'), '%Y-%m-%d') 
-                      >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH) 
+        SUM(CASE WHEN STR_TO_DATE(CONCAT(sales_year, '-', sales_month, '-01'), '%Y-%m-%d')
+                      >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
                  THEN monthly_value ELSE 0 END) as recent_6m_value,
-        SUM(CASE WHEN STR_TO_DATE(CONCAT(sales_year, '-', sales_month, '-01'), '%Y-%m-%d') 
-                      < DATE_SUB(CURDATE(), INTERVAL 6 MONTH) 
+        SUM(CASE WHEN STR_TO_DATE(CONCAT(sales_year, '-', sales_month, '-01'), '%Y-%m-%d')
+                      < DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
                  THEN monthly_value ELSE 0 END) as previous_6m_value
     FROM monthly_sales
     GROUP BY part_number, part_name
 ),
 
 forecast_calculations AS (
-    SELECT 
+    SELECT
         *,
         -- Growth Rate Calculations
-        CASE 
-            WHEN previous_6m_quantity > 0 
+        CASE
+            WHEN previous_6m_quantity > 0
             THEN ((recent_6m_quantity - previous_6m_quantity) / previous_6m_quantity) * 100
-            ELSE 0 
+            ELSE 0
         END as quantity_growth_rate_percent,
-        
-        CASE 
-            WHEN previous_6m_value > 0 
+       
+        CASE
+            WHEN previous_6m_value > 0
             THEN ((recent_6m_value - previous_6m_value) / previous_6m_value) * 100
-            ELSE 0 
+            ELSE 0
         END as value_growth_rate_percent,
-        
+       
         -- Seasonality Factor (simplified)
-        CASE 
+        CASE
             WHEN active_months >= 6 THEN 1.0
             WHEN active_months >= 3 THEN 0.8
             ELSE 0.6
         END as seasonality_factor,
-        
+       
         -- Demand Consistency Score
-        CASE 
+        CASE
             WHEN active_months >= 10 THEN 'High'
             WHEN active_months >= 6 THEN 'Medium'
             ELSE 'Low'
@@ -1201,70 +1243,70 @@ forecast_calculations AS (
     WHERE total_quantity_12m > 0
 )
 
-SELECT 
+SELECT
     part_number,
     part_name,
-    
+   
     -- Historical Performance
     total_quantity_12m as historical_quantity_12m,
     ROUND(total_value_12m, 2) as historical_value_12m,
     ROUND(avg_monthly_quantity, 2) as avg_monthly_quantity,
     ROUND(avg_monthly_value, 2) as avg_monthly_value,
     ROUND(avg_unit_price, 2) as avg_unit_price,
-    
+   
     -- Trend Analysis
     ROUND(quantity_growth_rate_percent, 2) as quantity_growth_rate_percent,
     ROUND(value_growth_rate_percent, 2) as value_growth_rate_percent,
     demand_consistency,
-    
+   
     -- 3-Month Forecast
     ROUND(
-        (avg_monthly_quantity * 3) * 
-        (1 + (quantity_growth_rate_percent / 100)) * 
+        (avg_monthly_quantity * 3) *
+        (1 + (quantity_growth_rate_percent / 100)) *
         seasonality_factor, 0
     ) as forecasted_quantity_3m,
-    
+   
     ROUND(
-        (avg_monthly_value * 3) * 
-        (1 + (value_growth_rate_percent / 100)) * 
+        (avg_monthly_value * 3) *
+        (1 + (value_growth_rate_percent / 100)) *
         seasonality_factor, 2
     ) as forecasted_value_3m,
-    
+   
     -- 6-Month Forecast
     ROUND(
-        (avg_monthly_quantity * 6) * 
-        (1 + (quantity_growth_rate_percent / 100)) * 
+        (avg_monthly_quantity * 6) *
+        (1 + (quantity_growth_rate_percent / 100)) *
         seasonality_factor, 0
     ) as forecasted_quantity_6m,
-    
+   
     ROUND(
-        (avg_monthly_value * 6) * 
-        (1 + (value_growth_rate_percent / 100)) * 
+        (avg_monthly_value * 6) *
+        (1 + (value_growth_rate_percent / 100)) *
         seasonality_factor, 2
     ) as forecasted_value_6m,
-    
+   
     -- 12-Month Forecast
     ROUND(
-        (avg_monthly_quantity * 12) * 
-        (1 + (quantity_growth_rate_percent / 100)) * 
+        (avg_monthly_quantity * 12) *
+        (1 + (quantity_growth_rate_percent / 100)) *
         seasonality_factor, 0
     ) as forecasted_quantity_12m,
-    
+   
     ROUND(
-        (avg_monthly_value * 12) * 
-        (1 + (value_growth_rate_percent / 100)) * 
+        (avg_monthly_value * 12) *
+        (1 + (value_growth_rate_percent / 100)) *
         seasonality_factor, 2
     ) as forecasted_value_12m,
-    
+   
     -- Investment Planning
     ROUND(
-        ((avg_monthly_value * 12) * 
-        (1 + (value_growth_rate_percent / 100)) * 
+        ((avg_monthly_value * 12) *
+        (1 + (value_growth_rate_percent / 100)) *
         seasonality_factor) * 0.3, 2
     ) as recommended_inventory_investment_12m,
-    
+   
     -- Risk Assessment
-    CASE 
+    CASE
         WHEN quantity_growth_rate_percent > 20 AND demand_consistency = 'High' THEN 'High Growth - Stock Up'
         WHEN quantity_growth_rate_percent > 0 AND demand_consistency = 'High' THEN 'Steady Growth - Monitor'
         WHEN quantity_growth_rate_percent < -10 THEN 'Declining - Reduce Stock'
@@ -1445,7 +1487,7 @@ Trigger Keywords:
 Target Intent: Find customers who have an active AMC but have NOT made any parts or engine purchases in the last 12 months.
 
 ENFORCED SQL QUERY:
-SELECT 
+SELECT
     amc.customer_name,
     amc.customer_address,
     amc.customer_location,
@@ -1518,39 +1560,38 @@ Automatically apply specific query patterns when user asks:
     Return ONLY the SQL query without any explanation:
     """
 
+        
         try:
-            response = self.client.chat.completions.create(
-                model=OPENAI_MODEL,
+            response = self.call_llm_api(
                 messages=[
                     {
-                        "role": "system", 
+                        "role": "system",
                         "content": "You are a MySQL expert who generates precise queries based on actual data patterns. Focus on selecting the correct table and using exact column values. Avoid common mistakes like filtering by non-existent values or using wrong tables for specific business questions."
                     },
                     {
-                        "role": "user", 
+                        "role": "user",
                         "content": prompt
                     }
                 ],
-                temperature=0.01,  # Very low for maximum accuracy
+                temperature=0.01, # Very low for maximum accuracy
                 max_tokens=1500
             )
             
             # Clean the SQL query before returning
-            return self.clean_sql_query(response.choices[0].message.content)
-            
+            return self.clean_sql_query(response)
+        
         except Exception as e:
             logger.error(f"Error in generate_sql_query: {e}")
             return ""
-
-
+    
     def execute_sql_query(self, query: str) -> Tuple[List[Dict], List[str]]:
         """Execute the SQL query and return the results."""
         if not query:
             return [], ["Empty query provided"]
-            
+        
         if not self.db_connection or not self.db_connection.is_connected():
             self.setup_db_connection()
-            
+        
         try:
             cursor = self.db_connection.cursor(dictionary=True)
             cursor.execute(query)
@@ -1566,19 +1607,19 @@ Automatically apply specific query patterns when user asks:
                     else:
                         converted_row[key] = value
                 converted_results.append(converted_row)
-                
+            
             column_names = [col[0] for col in cursor.description] if cursor.description else []
             cursor.close()
             
             return converted_results, column_names
-            
+        
         except Error as e:
             logger.error(f"Error executing SQL query: {e}")
             return [], [str(e)]
         except Exception as e:
             logger.error(f"Unexpected error executing SQL query: {e}")
             return [], [str(e)]
-
+    
     def generate_final_answer(self, user_question: str, query: str, query_results: List[Dict], column_names: List[str]) -> str:
         """Generate a professional answer based on the query results with chunking for large datasets."""
         if not query_results:
@@ -1594,17 +1635,17 @@ Automatically apply specific query patterns when user asks:
             estimated_tokens = len(results_json) // 4
             
             # If results are too large, use chunking and summarization
-            if estimated_tokens > 20000:  # Conservative threshold to avoid rate limits
+            if estimated_tokens > 20000: # Conservative threshold to avoid rate limits
                 logger.info(f"Large dataset detected ({estimated_tokens} estimated tokens), using chunked summarization")
                 return self._generate_chunked_answer(user_question, query, query_results, column_names)
             
             # For smaller datasets, use the original approach
             return self._generate_direct_answer(user_question, query, query_results, column_names)
-            
+        
         except Exception as e:
             logger.error(f"Error in generate_final_answer: {e}")
             return f"An error occurred while generating the answer: {str(e)}"
-
+    
     def _generate_direct_answer(self, user_question: str, query: str, query_results: List[Dict], column_names: List[str]) -> str:
         """Original implementation for smaller datasets."""
         results_str = json.dumps({
@@ -1613,43 +1654,42 @@ Automatically apply specific query patterns when user asks:
         }, indent=2, cls=CustomJSONEncoder)
         
         prompt = f"""
-    You are a professional Chartered Accountant and financial analyst for PowerParts Private Ltd.
-    Based on the following user question, SQL query, and query results, generate a concise professional summary that will be perfectly formatted for the frontend UI.
+        You are a professional Chartered Accountant and financial analyst for PowerParts Private Ltd.
+        Based on the following user question, SQL query, and query results, generate a concise professional summary that will be perfectly formatted for the frontend UI.
 
-    CRITICAL FORMATTING RULES:
-    Always use this exact bullet point format: "▸ " followed by a space (e.g., ▸ Total Active Customers: 397)
-    Do not use markdown symbols like *, **, -, or #
-    Format all numbers with commas (e.g., 1,000 not 1000)
-    Use clear section headings that are relevant to the actual query results
-    Put each data point on its own line
-    Ensure all currency values are represented in Indian Rupees (₹)
-    Keep language simple, clear, and professional
-    Be concise but insightful
+        CRITICAL FORMATTING RULES:
+        Always use this exact bullet point format: "▸ " followed by a space (e.g., ▸ Total Active Customers: 397)
+        Do not use markdown symbols like *, **, -, or #
+        Format all numbers with commas (e.g., 1,000 not 1000)
+        Use clear section headings that are relevant to the actual query results
+        Put each data point on its own line
+        Ensure all currency values are represented in Indian Rupees (₹)
+        Keep language simple, clear, and professional
+        Be concise but insightful
 
-    User Question: {user_question}
+        User Question: {user_question}
 
-    SQL Query Used:
-    {query}
+        SQL Query Used:
+        {query}
 
-    Query Results:
-    {results_str}
+        Query Results:
+        {results_str}
 
-    Column Names: {column_names}
+        Column Names: {column_names}
 
-    Generate your response using ONLY the actual query results provided above.
-    """
+        Generate your response using ONLY the actual query results provided above.
+        """
         
         try:
-            response = self.client.chat.completions.create(
-                model=OPENAI_MODEL,
+            response = self.call_llm_api(
                 messages=[
                     {
-                        "role": "system", 
-                        "content": """You are a professional data analyst that explains query results in clear, 
+                        "role": "system",
+                        "content": """You are a professional data analyst that explains query results in clear,
                         business-appropriate language formatted for a specific frontend UI."""
                     },
                     {
-                        "role": "user", 
+                        "role": "user",
                         "content": prompt
                     }
                 ],
@@ -1657,19 +1697,19 @@ Automatically apply specific query patterns when user asks:
                 max_tokens=2000
             )
             
-            answer = response.choices[0].message.content
+            answer = response
             return self._clean_response_formatting(answer)
-            
+        
         except Exception as e:
             logger.error(f"Error in _generate_direct_answer: {e}")
             return f"Error generating response: {str(e)}"
-
+    
     def _generate_chunked_answer(self, user_question: str, query: str, query_results: List[Dict], column_names: List[str]) -> str:
         """Generate answer for large datasets using chunking and summarization."""
         logger.info(f"Starting chunked summarization for {len(query_results)} rows")
         
         # Split data into manageable chunks (adjust chunk_size based on your data complexity)
-        chunk_size = 300  # Smaller chunks for safety
+        chunk_size = 300 # Smaller chunks for safety
         chunks = [query_results[i:i + chunk_size] for i in range(0, len(query_results), chunk_size)]
         
         logger.info(f"Split into {len(chunks)} chunks of {chunk_size} rows each")
@@ -1688,8 +1728,8 @@ Automatically apply specific query patterns when user asks:
         final_summary = self._generate_final_summary(user_question, query, chunk_summaries, len(query_results))
         
         return final_summary
-
-    def _summarize_chunk(self, user_question: str, query: str, chunk_data: List[Dict], column_names: List[str], 
+    
+    def _summarize_chunk(self, user_question: str, query: str, chunk_data: List[Dict], column_names: List[str],
                         chunk_number: int, total_chunks: int) -> str:
         """Summarize a single chunk of data."""
         chunk_str = json.dumps({
@@ -1698,69 +1738,67 @@ Automatically apply specific query patterns when user asks:
         }, indent=2, cls=CustomJSONEncoder)
         
         prompt = f"""
-    You are summarizing a portion of a large dataset for PowerParts Private Ltd.
-    This is chunk {chunk_number} of {total_chunks}. Focus on key patterns, trends, and important numbers.
+        You are summarizing a portion of a large dataset for PowerParts Private Ltd.
+        This is chunk {chunk_number} of {total_chunks}. Focus on key patterns, trends, and important numbers.
 
-    User Question: {user_question}
-    SQL Query: {query}
+        User Question: {user_question}
+        SQL Query: {query}
 
-    Data Chunk {chunk_number}/{total_chunks}:
-    {chunk_str}
+        Data Chunk {chunk_number}/{total_chunks}:
+        {chunk_str}
 
-    Provide a concise summary of this data chunk focusing on:
-    1. Key numerical values and their significance
-    2. Notable patterns or trends
-    3. Any outliers or exceptional values
-    4. Business implications specific to this chunk
+        Provide a concise summary of this data chunk focusing on:
+        1. Key numerical values and their significance
+        2. Notable patterns or trends
+        3. Any outliers or exceptional values
+        4. Business implications specific to this chunk
 
-    Keep your summary focused and factual. Return ONLY the summary text.
-    """
+        Keep your summary focused and factual. Return ONLY the summary text.
+        """
         
         try:
-            response = self.client.chat.completions.create(
-                model=OPENAI_MODEL,
+            response = self.call_llm_api(
                 messages=[
                     {"role": "system", "content": "You summarize data chunks concisely and accurately."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
-                max_tokens=500  # Shorter responses for chunks
+                max_tokens=500 # Shorter responses for chunks
             )
             
-            return response.choices[0].message.content.strip()
-            
+            return response.strip()
+        
         except Exception as e:
             logger.error(f"Error summarizing chunk {chunk_number}: {e}")
             return f"Summary unavailable for chunk {chunk_number} due to error."
-
+    
     def _generate_final_summary(self, user_question: str, query: str, chunk_summaries: List[str], total_rows: int) -> str:
         """Generate final summary from chunk summaries."""
         all_summaries = "\n\n".join([f"Chunk {i+1} Summary:\n{summary}" for i, summary in enumerate(chunk_summaries)])
         
         prompt = f"""
-    You are a professional Chartered Accountant and financial analyst for PowerParts Private Ltd.
-    Based on the user question and summaries of all data chunks, generate a comprehensive final analysis.
+        You are a professional Chartered Accountant and financial analyst for PowerParts Private Ltd.
+        Based on the user question and summaries of all data chunks, generate a comprehensive final analysis.
 
-    User Question: {user_question}
-    SQL Query: {query}
-    Total Rows Analyzed: {total_rows:,}
+        User Question: {user_question}
+        SQL Query: {query}
+        Total Rows Analyzed: {total_rows:,}
 
-    Chunk Summaries:
-    {all_summaries}
+        Chunk Summaries:
+        {all_summaries}
 
-    Generate a professional summary that:
-    1. Synthesizes insights from all chunk summaries
-    2. Provides overall trends and patterns
-    3. Highlights key business implications
-    4. Uses proper formatting with "▸ " bullet points
-    5. Includes recommendations based on the complete dataset
+        Generate a professional summary that:
+        1. Synthesizes insights from all chunk summaries
+        2. Provides overall trends and patterns
+        3. Highlights key business implications
+        4. Uses proper formatting with "▸ " bullet points
+        5. Includes recommendations based on the complete dataset
 
-    Follow the same formatting rules as the direct analysis method.
-    """
-        
+        Follow the same formatting rules as the direct analysis method.
+        """
+
         try:
-            response = self.client.chat.completions.create(
-                model=OPENAI_MODEL,
+            response = self.call_llm_api(
                 messages=[
                     {"role": "system", "content": "You synthesize chunk summaries into comprehensive analyses."},
                     {"role": "user", "content": prompt}
@@ -1768,23 +1806,24 @@ Automatically apply specific query patterns when user asks:
                 temperature=0.2,
                 max_tokens=2000
             )
-            
-            answer = response.choices[0].message.content
+
+            answer = response
             return self._clean_response_formatting(answer)
-            
+
         except Exception as e:
             logger.error(f"Error generating final summary: {e}")
             # Fallback: return concatenated chunk summaries
             return f"Comprehensive analysis of {total_rows:,} rows:\n\n" + "\n\n".join(chunk_summaries)
+
     def _clean_response_formatting(self, answer: str) -> str:
         """Clean and standardize the response formatting."""
         # Remove all markdown formatting
         answer = answer.replace("**", "").replace("*", "").replace("###", "").replace("##", "").replace("#", "")
-        
+
         # Fix bullet points - ensure they use the correct format
         lines = answer.split('\n')
         cleaned_lines = []
-        
+
         for line in lines:
             line = line.strip()
             if line.startswith('- '):
@@ -1796,26 +1835,26 @@ Automatically apply specific query patterns when user asks:
             elif line.startswith('▸') and not line.startswith('▸ '):
                 # Ensure proper spacing after our bullet
                 cleaned_lines.append(f"▸ {line[1:].strip()}")
-            elif line.startswith('    ▸'):
+            elif line.startswith(' ▸'):
                 # Handle indented bullets and fix spacing
-                cleaned_lines.append(f"    ▸ {line[5:].strip()}")
+                cleaned_lines.append(f" ▸ {line[5:].strip()}")
             else:
                 cleaned_lines.append(line)
-        
+
         # Rejoin lines
         answer = '\n'.join(cleaned_lines)
-        
+
         # Ensure proper spacing between sections
         sections = answer.split('\n\n')
         cleaned_sections = []
-        
+
         for section in sections:
             section = section.strip()
-            if section:  # Only add non-empty sections
+            if section: # Only add non-empty sections
                 cleaned_sections.append(section)
-        
+
         answer = '\n\n'.join(cleaned_sections)
-        
+
         # Remove any references to example data that might have leaked through
         example_phrases = [
             "engine sales performance over time",
@@ -1826,20 +1865,20 @@ Automatically apply specific query patterns when user asks:
             "₹37,82,60,19.02",
             "₹10,17,37,403.41"
         ]
-        
+
         answer_lower = answer.lower()
         for phrase in example_phrases:
             if phrase.lower() in answer_lower:
                 # If example data is found, this indicates the AI used example instead of real data
                 logger.warning("Example data detected in response, this should not happen")
-        
+
         return answer
 
     def determine_visualization_type(self, columns: List[str], data: List[Dict]) -> Optional[str]:
         """Determine the best visualization type based on the data."""
         if not data:
             return None
-            
+
         # Count numeric columns
         numeric_cols = 0
         for col in columns:
@@ -1852,14 +1891,14 @@ Automatically apply specific query patterns when user asks:
                 if not isinstance(val, (int, float)) and not (isinstance(val, str) and val.replace('.', '', 1).isdigit()):
                     all_numeric = False
                     break
-            
+
             if all_numeric:
                 numeric_cols += 1
-        
+
         if numeric_cols == 0:
             return None
         elif numeric_cols == 1:
-            return "bar"  # Simple bar chart for single numeric column
+            return "bar" # Simple bar chart for single numeric column
         elif numeric_cols >= 2:
             # If we have a date/time column, use line chart
             for col in columns:
@@ -1867,43 +1906,43 @@ Automatically apply specific query patterns when user asks:
                     val = row.get(col)
                     if isinstance(val, str) and any(c in val for c in ['-', '/']):
                         return "line"
-            return "bar"  # Default to bar chart for multiple numeric columns
-        
+            return "bar" # Default to bar chart for multiple numeric columns
+
         return None
 
     def process_question(self, user_question: str, is_follow_up: bool = False, context: Optional[Dict] = None, user_id: Optional[str] = None) -> Dict:
         """Full RAG pipeline to process a user question with optional follow-up context."""
         process_log = []
-        
+
         try:
             # Generate a query ID for this interaction
             query_id = str(uuid.uuid4())
-        
+
             # Step 0: Handle follow-up questions
             final_question = user_question
             if is_follow_up or self.follow_up_handler.is_follow_up(user_question):
                 is_follow_up = True
                 process_log.append(f"Follow-up question detected: {user_question}")
-                
+
                 final_question = self.follow_up_handler.rewrite_follow_up(user_question)
                 process_log.append(f"Original question: {user_question}")
                 process_log.append(f"Rewritten question: {final_question}")
 
-            
+
             # Step 1: Classify the question
             question_type = self.classify_question(final_question)
             process_log.append(f"Question classified as: {question_type}")
-            
+
             if question_type == "greeting":
                 process_log.append("Generating greeting response...")
                 greeting_response = self.generate_greeting_response(final_question)
-                
+
                 # Add to context even if greeting for continuity
                 self.follow_up_handler.conversation_context.add_context(
                     question=user_question,
                     answer=greeting_response
                 )
-                
+
                 # Save greeting to history if user is authenticated
                 if user_id:
                     self.history_manager.save_to_history(
@@ -1912,7 +1951,7 @@ Automatically apply specific query patterns when user asks:
                         question=user_question,
                         answer=greeting_response
                     )
-                
+
                 return {
                     "status": "success",
                     "question_type": "greeting",
@@ -1921,12 +1960,12 @@ Automatically apply specific query patterns when user asks:
                     "is_follow_up": is_follow_up,
                     "query_id": query_id
                 }
-            
+
             # Step 2: Rank relevant tables
             process_log.append("Analyzing question to identify relevant data tables...")
             table_rankings = self.get_table_rankings(final_question)
             relevant_tables = [t["table_name"] for t in table_rankings if t["relevance_score"] >= 5]
-            
+
             if not relevant_tables:
                 return {
                     "status": "error",
@@ -1935,9 +1974,9 @@ Automatically apply specific query patterns when user asks:
                     "is_follow_up": is_follow_up,
                     "query_id": query_id
                 }
-            
+
             process_log.append(f"Identified relevant tables: {', '.join(relevant_tables)}")
-            
+
             # Step 3: Generate SQL query
             process_log.append("Generating SQL query for the question...")
             query = self.generate_sql_query(final_question, relevant_tables)
@@ -1949,14 +1988,14 @@ Automatically apply specific query patterns when user asks:
                     "is_follow_up": is_follow_up,
                     "query_id": query_id
                 }
-            
-            process_log.append(f"Generated SQL query: {query[:100]}...")  # Log first 100 chars
-            
+
+            process_log.append(f"Generated SQL query: {query[:100]}...") # Log first 100 chars
+
             # Step 4: Execute query
             process_log.append("Executing query against the database...")
             query_results, column_names = self.execute_sql_query(query)
-            
-            if isinstance(query_results, str):  # Error case
+
+            if isinstance(query_results, str): # Error case
                 return {
                     "status": "error",
                     "message": f"Error executing query: {query_results}",
@@ -1965,32 +2004,32 @@ Automatically apply specific query patterns when user asks:
                     "is_follow_up": is_follow_up,
                     "query_id": query_id
                 }
-            
+
             process_log.append(f"Query executed successfully, returned {len(query_results)} rows")
-            
+
             # Step 5: Generate final answer
             process_log.append("Generating natural language response...")
             final_answer = self.generate_final_answer(final_question, query, query_results, column_names)
 
             self.follow_up_handler.conversation_context.add_context(
-            question=user_question,  # Store original question
-            answer=final_answer,
-            sql_query=query,
-            query_results=query_results  # Include the actual data
-        )
-            
+                question=user_question, # Store original question
+                answer=final_answer,
+                sql_query=query,
+                query_results=query_results # Include the actual data
+            )
+
             # Determine visualization type
             visualization_type = self.determine_visualization_type(column_names, query_results)
             if visualization_type:
                 process_log.append(f"Identified {visualization_type} chart as appropriate visualization")
-            
+
             # Add to conversation context
             self.follow_up_handler.conversation_context.add_context(
-                question=user_question,  # Store original question
+                question=user_question, # Store original question
                 answer=final_answer,
                 sql_query=query
             )
-            
+
             # Save to history database
             if user_id:
                 self.history_manager.save_to_history(
@@ -2000,7 +2039,7 @@ Automatically apply specific query patterns when user asks:
                     answer=final_answer,
                     sql_query=query
                 )
-            
+
             return {
                 "status": "success",
                 "question_type": "analytical",
@@ -2015,7 +2054,7 @@ Automatically apply specific query patterns when user asks:
                 "original_question": user_question if is_follow_up else None,
                 "query_id": query_id
             }
-            
+
         except Exception as e:
             logger.error(f"Error in process_question: {e}")
             process_log.append(f"Error occurred: {str(e)}")
@@ -2027,7 +2066,7 @@ Automatically apply specific query patterns when user asks:
                 "query_id": query_id if 'query_id' in locals() else str(uuid.uuid4())
             }
 
-# Initialize the RAG system
+    # Initialize the RAG system
 rag_system = PowerPartsRAGSystem()
 
 @app.on_event("shutdown")
@@ -2036,7 +2075,7 @@ def shutdown_event():
     rag_system.history_manager.close_connection()
     rag_system.user_manager.close_connection()
 
-# Authentication Endpoints
+    # Authentication Endpoints
 @app.post("/api/auth/register")
 async def register_user(request: Request):
     """Endpoint to register a new user."""
@@ -2045,22 +2084,22 @@ async def register_user(request: Request):
         email = data.get("email", "").strip()
         name = data.get("name", "").strip()
         password = data.get("password", "").strip()
-        
+
         if not email or not password or not name:
             raise HTTPException(status_code=400, detail="Email, name and password are required")
-            
+
         if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
             raise HTTPException(status_code=400, detail="Invalid email format")
-            
+
         if len(password) < 8:
             raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
-            
+
         success = rag_system.user_manager.register_user(email, name, password)
         if not success:
             raise HTTPException(status_code=400, detail="Registration failed (email may already exist)")
-            
+
         return JSONResponse(content={"status": "success", "message": "User registered successfully"})
-        
+
     except Exception as e:
         logger.error(f"Error in user registration: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -2072,14 +2111,14 @@ async def login_user(request: Request):
         data = await request.json()
         email = data.get("email", "").strip()
         password = data.get("password", "").strip()
-        
+
         if not email or not password:
             raise HTTPException(status_code=400, detail="Email and password are required")
-            
+
         user = rag_system.user_manager.authenticate_user(email, password)
         if not user:
             raise HTTPException(status_code=401, detail="Invalid credentials")
-            
+
         return JSONResponse(content={
             "status": "success",
             "user": {
@@ -2088,12 +2127,12 @@ async def login_user(request: Request):
                 "name": user["name"]
             }
         })
-        
+
     except Exception as e:
         logger.error(f"Error in user login: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-# API Endpoints
 
+# API Endpoints
 @app.post("/api/query")
 async def submit_query(request: Request):
     try:
@@ -2132,9 +2171,9 @@ async def submit_query(request: Request):
             "original_question": result.get("original_question", question),
             "is_follow_up": is_follow_up,
             "timestamp": datetime.now()
-        }
+            }
 
-        # 🔁 Also store in query_cache
+            # 🔁 Also store in query_cache
         with query_lock:
             query_cache[query_id] = {
                 "status": "completed",
@@ -2149,7 +2188,6 @@ async def submit_query(request: Request):
         logger.error(f"Error in submit_query: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-
 @app.post("/api/clear-context")
 async def clear_conversation_context():
     """Endpoint to clear the conversation context."""
@@ -2159,9 +2197,6 @@ async def clear_conversation_context():
     except Exception as e:
         logger.error(f"Error clearing context: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    
-
-
 
 @app.get("/api/query/{query_id}")
 async def get_query_result(query_id: str):
@@ -2169,10 +2204,10 @@ async def get_query_result(query_id: str):
     try:
         with query_lock:
             result = query_cache.get(query_id)
-        
+
         if not result:
             raise HTTPException(status_code=404, detail="Query not found")
-        
+
         if result["status"] == "completed":
             response_data = {
                 "status": "completed",
@@ -2189,7 +2224,7 @@ async def get_query_result(query_id: str):
                 "timestamp": datetime.now().isoformat()
             }
             return JSONResponse(content=jsonable_encoder(response_data))
-        
+
         elif result["status"] == "failed":
             return JSONResponse(
                 status_code=400,
@@ -2199,17 +2234,17 @@ async def get_query_result(query_id: str):
                     "process_log": result.get("process_log", [])
                 }
             )
-        
-        else:  # processing
+
+        else: # processing
             return JSONResponse(content={
                 "status": "processing",
                 "process_log": result.get("process_log", [])
             })
-    
+
     except Exception as e:
         logger.error(f"Error in get_query_result: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    
+
 @app.get("/api/chat-history")
 async def get_chat_history(request: Request):
     """Endpoint to fetch user-specific chat history."""
@@ -2218,17 +2253,17 @@ async def get_chat_history(request: Request):
         user_id = request.headers.get("X-User-ID")
         if not user_id:
             raise HTTPException(status_code=401, detail="User ID required")
-            
+
         history = rag_system.history_manager.get_user_history(user_id)
         return JSONResponse(content=jsonable_encoder(history))
-        
+
     except Error as e:
         logger.error(f"Error fetching chat history: {e}")
         raise HTTPException(status_code=500, detail="Error fetching chat history")
     except Exception as e:
         logger.error(f"Unexpected error fetching chat history: {e}")
         raise HTTPException(status_code=500, detail="Unexpected error occurred")
-    
+
 # Frontend Routes
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
@@ -2238,15 +2273,15 @@ async def read_root(request: Request):
 # Error handlers
 @app.exception_handler(404)
 async def not_found_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
+        return JSONResponse(
         status_code=404,
         content={"message": exc.detail}
-    )
+        )
 
 @app.exception_handler(500)
 async def server_error_exception_handler(request: Request, exc: HTTPException):
     logger.error(f"Server error: {str(exc)}")
-    return JSONResponse(
+    JSONResponse(
         status_code=500,
         content={"message": "Internal server error"}
     )
